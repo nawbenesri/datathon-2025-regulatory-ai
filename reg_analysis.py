@@ -1,4 +1,5 @@
 # reg_analysis.py - Extraction enrichie avec NLP pour HTML / textes réglementaires
+import json
 import re
 import pandas as pd
 import xml.etree.ElementTree as ET
@@ -18,6 +19,60 @@ except ImportError:  # Le pipeline NLP reste optionnel
 
 _NLP_MODEL = None
 _MEASURE_MATCHER = None
+
+CONFIG_START = "<<<REGAI_CONFIG_START>>>"
+CONFIG_END = "<<<REGAI_CONFIG_END>>>"
+
+INLINE_CONFIG_EXAMPLE = """<<<REGAI_CONFIG_START>>>
+{
+  "params": {
+    "mention_boost": 0.25,
+    "theme_boost": 0.10,
+    "measure_intensity_scale": 0.02,
+    "measure_intensity_cap": 0.20,
+    "penalty_boost": 0.05,
+    "loss_pct_multiplier": 20,
+    "max_loss_pct": 20,
+    "ticker_min_len": 3
+  },
+  "company_theme_keywords": {
+    "Technology": ["software","cloud","saas","ai","chip","semiconductor","cyber","it services","analytics","datacenter"]
+  },
+  "reg_type_targets": {
+    "AI Promotion / Regulation": ["Technology","Financials","Healthcare"],
+    "Energy / Environmental": ["Energy","Industrial"]
+  }
+}
+<<<REGAI_CONFIG_END>>>"""
+
+
+def _parse_inline_config(raw_text: str):
+    if not raw_text:
+        return {}, raw_text
+
+    m = re.search(rf"{re.escape(CONFIG_START)}(.*?){re.escape(CONFIG_END)}", raw_text, re.S)
+    if not m:
+        return {}, raw_text
+
+    block = m.group(1)
+    text_wo_block = raw_text[:m.start()] + raw_text[m.end():]
+    try:
+        cfg = json.loads(block)
+    except Exception:
+        cfg = {}
+    return (cfg or {}), text_wo_block
+
+
+DEFAULT_PARAMS = {
+    "mention_boost": 0.4,
+    "theme_boost": 0.25,
+    "measure_intensity_scale": 0.05,
+    "measure_intensity_cap": 0.35,
+    "penalty_boost": 0.1,
+    "loss_pct_multiplier": 5,
+    "max_loss_pct": 20,
+    "ticker_min_len": 1,
+}
 
 
 MEASURE_TERMS = [
@@ -60,7 +115,7 @@ FALLBACK_ENTITY_REGEX = r'\b(US|USA|United States|China|EU|European Union|Europe
 COMPANY_THEME_KEYWORDS = {
     "Energy": ["energy", "oil", "gas", "petro", "power", "utility", "renewable"],
     "Healthcare": ["health", "pharma", "drug", "bio", "med", "clinical"],
-    "Technology": ["tech", "digital", "soft", "cloud", "data", "ai", "chip", "semi", "cyber"],
+    "Technology": ["software", "cloud", "saas", "ai", "chip", "semiconductor", "cyber", "it services", "analytics", "datacenter"],
     "Consumer": ["consumer", "retail", "brand", "food", "beverage", "market", "store"],
     "Financials": ["bank", "financ", "capital", "insurance", "asset", "credit", "lending"],
     "Industrial": ["industrial", "manufact", "aero", "defense", "logistic", "transport"],
@@ -101,20 +156,23 @@ REG_TYPE_TARGETS = {
 }
 
 
-def _infer_company_theme(company):
+def _infer_company_theme(company, theme_keywords=None):
     if not isinstance(company, str):
         return "Other"
     clower = company.lower()
-    for theme, keywords in COMPANY_THEME_KEYWORDS.items():
-        if any(keyword in clower for keyword in keywords):
-            return theme
+    theme_keywords = theme_keywords or COMPANY_THEME_KEYWORDS
+    # Match par mots entiers (évite "Technologies" → "Technology" via "tech")
+    for theme, keywords in theme_keywords.items():
+        for kw in keywords:
+            if re.search(r'\b' + re.escape(kw) + r's?\b', clower):
+                return theme
     return "Other"
 
-
-def _themes_from_text(text):
+def _themes_from_text(text, theme_keywords=None):
     detected = set()
     lower = text.lower()
-    for keyword, theme in TEXT_THEME_KEYWORDS.items():
+    theme_keywords = theme_keywords or TEXT_THEME_KEYWORDS
+    for keyword, theme in theme_keywords.items():
         if keyword in lower:
             detected.add(theme)
     return detected
@@ -226,6 +284,7 @@ def clean_text(reg_text, file_extension):
 
 def extract_reg_info(reg_text, file_extension='txt'):
     """Extrait entités, dates et mesures en combinant NLP et heuristiques."""
+    cfg_overrides, reg_text = _parse_inline_config(reg_text)
     reg_text = clean_text(reg_text, file_extension)
     nlp = _load_nlp_model()
 
@@ -278,17 +337,45 @@ def extract_reg_info(reg_text, file_extension='txt'):
         'dates': sorted(dates),
         'measures': sorted(measures),
         'type_reg': type_reg,
+        'config': cfg_overrides,
     }
 
 
 # analyze_reg_impact reste à implémenter selon vos besoins
 def analyze_reg_impact(portfolio_df, reg_text, file_extension='txt'):
     if portfolio_df is None or (hasattr(portfolio_df, "empty") and portfolio_df.empty):
-        empty_info = {'entities': [], 'dates': [], 'measures': [], 'type_reg': 'Other'}
+        empty_info = {'entities': [], 'dates': [], 'measures': [], 'type_reg': 'Other', 'config': {}}
         return portfolio_df, empty_info, 0.0, pd.DataFrame(), []
 
     reg_text = reg_text or ""
     extracted = extract_reg_info(reg_text, file_extension)
+    cfg_overrides = extracted.get('config') or {}
+
+    params = DEFAULT_PARAMS.copy()
+    params.update(cfg_overrides.get('params', {}))
+
+    company_theme_keywords = {k: list(v) for k, v in COMPANY_THEME_KEYWORDS.items()}
+    for theme, keywords in cfg_overrides.get('company_theme_keywords', {}).items():
+        if isinstance(keywords, (list, tuple, set)):
+            company_theme_keywords[theme] = list(keywords)
+        else:
+            company_theme_keywords[theme] = [str(keywords)]
+
+    text_theme_keywords = TEXT_THEME_KEYWORDS.copy()
+    for theme, keywords in cfg_overrides.get('text_theme_keywords', {}).items():
+        if isinstance(keywords, (list, tuple, set)):
+            for kw in keywords:
+                text_theme_keywords[str(kw).lower()] = theme
+        else:
+            text_theme_keywords[str(keywords).lower()] = theme
+
+    reg_type_targets = {k: set(v) if isinstance(v, (set, list, tuple)) else {v} for k, v in REG_TYPE_TARGETS.items()}
+    for reg_type, themes in cfg_overrides.get('reg_type_targets', {}).items():
+        if isinstance(themes, (list, tuple, set)):
+            reg_type_targets[reg_type] = set(themes)
+        else:
+            reg_type_targets[reg_type] = {themes}
+
     df = portfolio_df.copy()
 
     required_cols = ['Risk Score', 'Impact Est. Loss %', 'Impact Est. Loss']
@@ -299,20 +386,26 @@ def analyze_reg_impact(portfolio_df, reg_text, file_extension='txt'):
     if 'Weight' not in df.columns:
         df['Weight'] = 0.0
 
-    df['Risk Theme'] = df.get('Risk Theme', df['Company'].apply(_infer_company_theme))
+    df['Risk Theme'] = df.get('Risk Theme', df['Company'].apply(lambda company: _infer_company_theme(company, company_theme_keywords)))
     lower_text = reg_text.lower()
 
     targeted_themes = _merge_theme_sets(
-        REG_TYPE_TARGETS.get(extracted['type_reg'], set()),
-        _themes_from_text(lower_text),
-        _themes_from_text(' '.join(extracted.get('entities', []))),
-        _themes_from_text(' '.join(extracted.get('measures', []))),
+        reg_type_targets.get(extracted['type_reg'], set()),
+        _themes_from_text(lower_text, text_theme_keywords),
+        _themes_from_text(' '.join(extracted.get('entities', [])), text_theme_keywords),
+        _themes_from_text(' '.join(extracted.get('measures', [])), text_theme_keywords),
     )
 
-    mention_boost = 0.4
-    theme_boost = 0.25
-    measure_intensity = min(0.05 * len(extracted.get('measures', [])), 0.35)
-    penalty_flag = 0.1 if 'penalt' in lower_text or 'sanction' in lower_text else 0.0
+    mention_boost = float(params.get('mention_boost', DEFAULT_PARAMS['mention_boost']))
+    theme_boost = float(params.get('theme_boost', DEFAULT_PARAMS['theme_boost']))
+    measure_intensity_scale = float(params.get('measure_intensity_scale', DEFAULT_PARAMS['measure_intensity_scale']))
+    measure_intensity_cap = float(params.get('measure_intensity_cap', DEFAULT_PARAMS['measure_intensity_cap']))
+    measure_intensity = min(measure_intensity_scale * len(extracted.get('measures', [])), measure_intensity_cap)
+    penalty_boost = float(params.get('penalty_boost', DEFAULT_PARAMS['penalty_boost']))
+    penalty_flag = penalty_boost if 'penalt' in lower_text or 'sanction' in lower_text else 0.0
+    ticker_min_len = max(1, int(params.get('ticker_min_len', DEFAULT_PARAMS['ticker_min_len'])))
+    loss_multiplier = float(params.get('loss_pct_multiplier', DEFAULT_PARAMS['loss_pct_multiplier']))
+    max_loss_pct = float(params.get('max_loss_pct', DEFAULT_PARAMS['max_loss_pct']))
 
     risk_drivers = []
     for idx, row in df.iterrows():
@@ -321,7 +414,11 @@ def analyze_reg_impact(portfolio_df, reg_text, file_extension='txt'):
         company_lower = str(row.get('Company', '')).lower()
         symbol_lower = str(row.get('Symbol', '')).lower()
 
-        if symbol_lower and symbol_lower in lower_text or company_lower and company_lower in lower_text:
+        # Détection robuste (évite les faux positifs, ex. ticker 'A')
+        symbol_mentioned  = len(symbol_lower) >= ticker_min_len and re.search(r'\b' + re.escape(symbol_lower) + r'\b', lower_text)
+        company_mentioned = company_lower and re.search(r'\b' + re.escape(company_lower) + r'\b', lower_text)
+
+        if symbol_mentioned or company_mentioned:
             risk += mention_boost
             drivers.append("Mention explicite")
 
@@ -339,7 +436,7 @@ def analyze_reg_impact(portfolio_df, reg_text, file_extension='txt'):
             drivers.append("Exigence de conformité")
 
         risk = min(risk, 1.0)
-        loss_pct = min(risk * 5, 20.0)  # pourcentage exprimé en points
+        loss_pct = min(risk * loss_multiplier, max_loss_pct)  # pourcentage exprimé en points
         market_cap = row.get('Market Cap', 0) or 0
         impact_loss = market_cap * (loss_pct / 100.0)
 
