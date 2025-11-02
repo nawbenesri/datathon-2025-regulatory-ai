@@ -5,6 +5,8 @@ from data_loader import load_sp500_composition, load_stocks_performance, merge_s
 from reg_analysis import extract_reg_info
 from analyze_reg_impact_enhanced import analyze_reg_impact_enhanced
 import plotly.express as px
+import pandas as pd
+from collections import Counter
 
 st.set_page_config(page_title="RegAI Portfolio Analyzer", layout="wide")
 st.title("Team 37")
@@ -116,12 +118,48 @@ if selected_step == "2. Upload et Extraction du Texte Réglementaire":
             st.session_state['reg_texts'] = reg_texts  # Store list
             
             # Display per file
+            # --- Affichage Amélioré des Résultats ---
+
+
+            st.markdown("## 📑 Résumé des Textes Réglementaires Analysés")
+
             for name, extracted in all_extracted:
-                st.subheader(f"Éléments Extraits de {name}:")
-                st.write(f"**Entités:** {', '.join(sorted(extracted['entities']))}")
-                st.write(f"**Dates:** {', '.join(sorted(extracted['dates']))}")
-                st.write(f"**Mesures:** {', '.join(sorted(extracted['measures']))}")
-                st.write(f"**Type de Réglementation:** {extracted['type_reg']}")
+                with st.expander(f"📘 {name}", expanded=False):
+                    # --- Ligne 1 : résumé rapide ---
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Entités détectées", len(extracted['entities']))
+                    col2.metric("Périodes mentionnées", len(extracted['dates']))
+                    col3.metric("Thèmes / Mesures", len(extracted['measures']))
+
+                    st.markdown(f"**Type de Réglementation :** `{extracted['type_reg']}`")
+
+                    # --- Entités principales ---
+                    st.markdown("### 🏛️ Entités Principales")
+                    entities_preview = sorted(list(extracted['entities']))[:15]
+                    st.write(", ".join(entities_preview) + (" ..." if len(extracted['entities']) > 15 else ""))
+
+                    # --- Thèmes clés / mots-clés ---
+                    st.markdown("### 🧩 Thèmes / Mots-clés Dominants")
+                    common_measures = Counter(extracted["measures"]).most_common(10)
+                    if common_measures:
+                        df_common = pd.DataFrame(common_measures, columns=["Mot-clé", "Occurrences"])
+                        fig = px.bar(df_common, x="Mot-clé", y="Occurrences", title="Top 10 Thèmes Détectés", height=300)
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Aucun mot-clé dominant détecté.")
+
+                    # --- Périodes clés ---
+                    st.markdown("### 📅 Périodes Mentionnées")
+                    dates_preview = sorted(list(extracted['dates']))[:10]
+                    st.write(", ".join(dates_preview) + (" ..." if len(extracted['dates']) > 10 else ""))
+
+                    # --- Synthèse automatique ---
+                    st.markdown("### 🧠 Synthèse")
+                    st.info(
+                        f"La directive contient **{len(extracted['entities'])} entités**, "
+                        f"**{len(extracted['dates'])} références temporelles** "
+                        f"et **{len(extracted['measures'])} thèmes économiques**."
+                    )
 
 # Étape 3: Modélisation de l'Impact
 if selected_step == "3. Modélisation de l'Impact":
