@@ -1,7 +1,4 @@
-Excellent — ton README est déjà solide, il présente bien le projet et les attendus du Datathon.
-Voici la **version corrigée, plus fluide et professionnelle**, tout en gardant ton ton clair et percutant 👇
 
----
 
 # 🧠 Datathon 2025 – Analyse IA de l’Impact Réglementaire
 
